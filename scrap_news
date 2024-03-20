@@ -1,0 +1,138 @@
+from bs4 import BeautifulSoup
+import requests
+import pandas as pd
+import sqlite3 
+import os
+import matplotlib.pyplot as plt
+from PIL import Image
+import glob
+from html import escape
+from datetime import datetime
+%matplotlib inline
+
+category_map = {
+    '100': '정치',
+    '101': '경제',
+    '102': '사회',
+    '103': '생활/문화',
+    '104': '세계',
+    '105': 'IT/과학',
+    '106': '연예',
+    '107': '스포츠'
+}
+
+def convert_date_format(original_date):
+    if '오전' in original_date:
+        original_date = original_date.replace('오전', 'AM')
+        is_pm = False
+    elif '오후' in original_date:
+        original_date = original_date.replace('오후', 'PM')
+        is_pm = True
+
+    dt = datetime.strptime(original_date, '%Y.%m.%d. %p %I:%M')
+
+    # 오후 시간을 24시간 형식으로 변환 (단, 오후 12시는 제외)
+    if is_pm and dt.hour < 12:
+        dt = dt.replace(hour=dt.hour + 12)
+
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_category_from_url(url):
+    # URL에서 sid 값을 추출
+    sid = url.split('sid=')[1] if 'sid=' in url else None
+    return category_map.get(sid, '기타')  # sid가 매핑 딕셔너리에 없는 경우 '기타' 카테고리 반환
+
+def news_crawl(query, start_date, end_date, sort_type, max_page):
+    dbpath = "news_info.db" 
+    conn = sqlite3.connect(dbpath)
+    cur = conn.cursor() 
+
+    script = """
+    DROP TABLE IF EXISTS news_crawl;
+
+    CREATE TABLE news_crawl(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 뉴스의 ID 값
+      date TEXT,                             -- 뉴스의 작성일
+      title TEXT,                            -- 뉴스의 제목
+      summary TEXT,                          -- 뉴스의 요약
+      link TEXT,                             -- 뉴스의 원문 링크
+      naver_link TEXT,                       -- 뉴스의 네이버 링크
+      content TEXT,                          -- 뉴스의 본문 내용
+      press TEXT,                            -- 뉴스의 언론사
+      category TEXT                          -- 뉴스의 카테고리
+    );
+    """
+    cur.executescript(script)
+    cur.execute("SELECT link FROM news_crawl")
+    existing_links = {row[0] for row in cur.fetchall()}
+        
+    if query == '':
+        query = '데이터 분석'
+    if len(start_date) != 10:
+        start_date = '2024.01.14'
+    if len(end_date) != 10:
+        end_date = '2024.01.17'
+    if sort_type not in ['0', '1', '2']:
+        sort_type = '0'
+#     start_date = start_date.replace(".", "")
+#     end_date = end_date.replace(".", "")
+    start_page=1
+
+    headers = {'User-Agent':'Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36'}
+
+    for page in range(1, max_page + 1):
+        start = 1 + (page - 1) * 10  # 페이지에 따른 시작 기사 번호 계산
+        url = f"https://search.naver.com/search.naver?where=news&query={query}&sm=tab_opt&sort={sort_type}&photo=0&field=0&reporter_article=&pd=3&ds={start_date}&de={end_date}&docid=&nso=so:r,p:from{start_date}to{end_date},a:all&mynews=0&refresh_start=0&related=0&start={start}"
+ 
+        web = requests.get(url, headers=headers).content
+        source = BeautifulSoup(web, 'html.parser')
+
+        # 각 페이지 내의 모든 뉴스 기사를 순회합니다.
+        for article in source.find_all('div', {'class': 'news_area'}):
+            title = article.find('a', {'class': 'news_tit'}).get('title').replace("'", "''")
+            link = article.find('a', {'class': 'news_tit'}).get('href').replace("'", "''")
+            summary = article.find('a', {'class': 'api_txt_lines dsc_txt_wrap'}).get_text().replace("'", "''")
+            naver_url = ""
+            if link not in existing_links:
+                existing_links.add(link)  # 링크 집합에 추가
+            #네이버 뉴스에 등록된 뉴스만 사용
+            for urls in article.find_all('a', {'class': 'info'}):
+                if urls["href"].startswith("https://n.news.naver.com"):
+                    naver_url = urls["href"].replace("'", "''")
+                    break
+            if naver_url:
+                category = get_category_from_url(naver_url)
+                response = requests.get(naver_url, headers=headers)
+                soup = BeautifulSoup(response.content, 'html.parser')
+                # 언론사명 추출
+                press_company_tag = soup.find('em', {'class':'media_end_linked_more_point'})
+                press_company = press_company_tag.get_text() if press_company_tag else "언론사 정보 없음"
+                date_text_tag = soup.find('span', {'class' : 'media_end_head_info_datestamp_time'})
+                date_text = date_text_tag.get_text() if date_text_tag else "날짜 정보 없음"
+                if date_text != "날짜 정보 없음":
+                    formatted_date = convert_date_format(date_text)
+                else:
+                    formatted_date = "날짜 형식 변환 실패"
+                #formatted_date = convert_date_format(date_text)
+                content_area = soup.find(id='dic_area')
+                news_content = content_area.get_text(strip=True).replace("'", "''") if content_area else "본문을 찾을 수 없습니다."
+                news_content = escape(news_content)
+
+                base_sql = "INSERT INTO news_crawl(date, title, summary, link, naver_link, content, press, category) values('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')"
+                sql_query = base_sql.format(formatted_date, title, summary, link, naver_url, news_content, press_company, category)
+                cur.execute(sql_query)
+                conn.commit()
+            else:
+                print(f"중복된 뉴스 건너뜀: {title}")
+            
+
+    conn.close()
+
+# 사용자 입력을 통한 크롤링 실행
+query = input('크롤링하고 싶은 뉴스 검색어를 입력해주세요: ')
+start_date = input('크롤링하고 싶은 뉴스의 시작 날짜를 입력해주세요(ex:2024.01.01): ')
+end_date = input('크롤링하고 싶은 뉴스의 종료 날짜를 입력해주세요(ex:2024.01.01): ')
+sort_type = int(input('크롤링하고 싶은 뉴스의 정렬방법을 입력해주세요(관련도순 = 0  최신순 = 1  오래된순 = 2): '))
+max_page = int(input('크롤링하고 싶은 뉴스의 페이지 수를 입력해주세요: '))
+news_crawl(query, start_date, end_date, sort_type, max_page)
